@@ -145,8 +145,8 @@ class AppState():
             else:
                 print (f'Last exchange order is a sell so setting the last_action to SELL')
 
-                print ('minimumOrderBase #1')
-                self.minimumOrderBase()
+                print ('minimumOrderQuote #1')
+                self.minimumOrderQuote()
                 self.last_action = 'SELL'
                 self.last_buy_price = 0.0
                 return
@@ -171,12 +171,12 @@ class AppState():
             print ('Order pairs normalised:', order_pairs_normalised)
 
             if order_pairs_normalised[0] < order_pairs_normalised[1]:
-                print ('minimumOrderBase #2')
-                self.minimumOrderBase()
+                print ('minimumOrderQuote #2')
+                self.minimumOrderQuote()
                 self.last_action = 'SELL'
             elif order_pairs_normalised[0] > order_pairs_normalised[1]:
-                print ('minimumOrderQuote #1')
-                self.minimumOrderQuote()
+                print ('minimumOrderBase #1')
+                self.minimumOrderBase()
                 self.last_action = 'BUY'
 
             else:
