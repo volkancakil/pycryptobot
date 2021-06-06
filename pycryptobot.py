@@ -23,6 +23,9 @@ account = TradingAccount(app)
 state = AppState(app, account)
 state.initLastAction()
 
+print (f'Starting last_action: {state.last_action}')
+sys.exit()
+
 s = sched.scheduler(time.time, time.sleep)
 
 def getAction(now: datetime = datetime.today().strftime('%Y-%m-%d %H:%M:%S'), app: PyCryptoBot = None, price: float = 0,
