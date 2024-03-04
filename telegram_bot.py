@@ -8,19 +8,21 @@ Usage:
 Press Ctrl-C on the command line or send a signal to the process to stop the bot.
 """
 import argparse
-import logging
+
 import os
 import json
 import subprocess
-import platform
+
+# import logging
 import re
 import urllib.request
-from sched import scheduler
 
 from datetime import datetime
-from time import sleep, time
+from time import sleep
+
+
 # from pandas.core.frame import DataFrame
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import InlineKeyboardButton, ReplyKeyboardMarkup
 from telegram.bot import Bot, BotCommand
 from telegram.ext import (
     Updater,
@@ -33,26 +35,25 @@ from telegram.ext import (
 from telegram.replykeyboardremove import ReplyKeyboardRemove
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# from telegram.utils.helpers import DEFAULT_20
-from models.chat import Telegram
-
-s = BackgroundScheduler(timezone='UTC')
-# jobId: Event
-
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+from models.telegram import (
+    TelegramControl,
+    TelegramHelper,
+    TelegramHandler,
+    TelegramActions,
+    ConfigEditor,
+    SettingsEditor,
 )
 
-logger = logging.getLogger(__name__)
+scannerSchedule = BackgroundScheduler(timezone="UTC")
 
+# TYPING_RESPONSE = 1
 CHOOSING, TYPING_REPLY = range(2)
 EXCHANGE, MARKET, ANYOVERRIDES, OVERRIDES, SAVE, START = range(6)
 EXCEPT_EXCHANGE, EXCEPT_MARKET = range(2)
 
-reply_keyboard = [["Coinbase Pro", "Binance", "Kucoin"]]
+replykeyboard = [["Coinbase", "Coinbase Pro", "Binance", "Kucoin"]]
 
-markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+markup = ReplyKeyboardMarkup(replykeyboard, one_time_keyboard=True)
 
 
 class TelegramBotBase:
@@ -64,89 +65,11 @@ class TelegramBotBase:
     datafolder = os.curdir
     data = {}
 
-    def _read_data(self, name: str = "data.json") -> None:
-        try:
-            with open(
-                os.path.join(self.datafolder, "telegram_data", name), "r", encoding="utf8"
-            ) as json_file:
-                self.data = json.load(json_file)
-        except FileNotFoundError as err:
-            logger.warning(err)
+    helper = None
+    handler = None
+    editor = None
 
-    def _write_data(self, name: str = "data.json") -> None:
-        try:
-            with open(
-                os.path.join(self.datafolder, "telegram_data", name),
-                "w",
-                encoding="utf8",
-            ) as outfile:
-                json.dump(self.data, outfile, indent=4)
-        except:
-            with open(
-                os.path.join(self.datafolder, "telegram_data", name),
-                "w",
-                encoding="utf8",
-            ) as outfile:
-                json.dump(self.data, outfile, indent=4)
-
-    def _getoptions(self, callbacktag, state):
-        buttons = []
-        keyboard = []
-        jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-        for file in jsonfiles:
-            if (
-                ".json" in file
-                and not file == "data.json"
-                and not file.__contains__("output.json")
-            ):
-                self._read_data(file)
-                if callbacktag == "sell":
-                    if "margin" in self.data:
-                        if self.data["margin"] != " ":
-                            buttons.append(
-                                InlineKeyboardButton(
-                                    file.replace(".json", ""),
-                                    callback_data=callbacktag + "_" + file,
-                                )
-                            )
-                elif callbacktag == "buy":
-                    if "margin" in self.data:
-                        if self.data["margin"] == " ":
-                            buttons.append(
-                                InlineKeyboardButton(
-                                    file.replace(".json", ""),
-                                    callback_data=callbacktag + "_" + file,
-                                )
-                            )
-                else:
-                    if "botcontrol" in self.data:
-                        if self.data["botcontrol"]["status"] == state:
-                            buttons.append(
-                                InlineKeyboardButton(
-                                    file.replace(".json", ""),
-                                    callback_data=callbacktag + "_" + file,
-                                )
-                            )
-
-        if len(buttons) > 0:
-            if len(buttons) > 1:
-                keyboard = [
-                    [InlineKeyboardButton("All", callback_data=callbacktag + "_all")]
-                ]
-
-            i = 0
-            while i <= len(buttons) - 1:
-                if len(buttons) - 1 >= i + 2:
-                    keyboard.append([buttons[i], buttons[i + 1], buttons[i + 2]])
-                elif len(buttons) - 1 >= i + 1:
-                    keyboard.append([buttons[i], buttons[i + 1]])
-                else:
-                    keyboard.append([buttons[i]])
-                i += 3
-            keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
-        return keyboard
-
-    def _checkifallowed(self, userid, update) -> bool:
+    def _check_if_allowed(self, userid, update) -> bool:
         if str(userid) != self.userid:
             update.message.reply_text("<b>Not authorised!</b>", parse_mode="HTML")
             return False
@@ -189,115 +112,65 @@ class TelegramBot(TelegramBotBase):
 
         self.config_file = args.config_file
 
-        with open(os.path.join(self.config_file), "r", encoding="utf8") as json_file:
-            self.config = json.load(json_file)
+        self.helper = TelegramHelper(self.config_file)
 
-        self.token = self.config["telegram"]["token"]
-        self.userid = self.config["telegram"]["user_id"]
-
-        # Config section for bot pair scanner
-        self.atr72pcnt = 4.0
-        self.enableleverage = False
-        self.maxbotcount = 0
-        self.autoscandelay = 0
-        self.enable_buy_next = True
-        self.autostart = False
-        if "scanner" in self.config:
-            self.atr72pcnt = (
-                self.config["scanner"]["atr72_pcnt"]
-                if "atr72_pcnt" in self.config["scanner"]
-                else self.atr72pcnt
-            )
-            self.enableleverage = (
-                self.config["scanner"]["enableleverage"]
-                if "enableleverage" in self.config["scanner"]
-                else self.enableleverage
-            )
-            self.maxbotcount = (
-                self.config["scanner"]["maxbotcount"]
-                if "maxbotcount" in self.config["scanner"]
-                else self.maxbotcount
-            )
-            self.autoscandelay = (
-                self.config["scanner"]["autoscandelay"]
-                if "autoscandelay" in self.config["scanner"]
-                else 0
-            )
-            self.enable_buy_next = (
-                self.config["scanner"]["enable_buy_next"]
-                if "enable_buy_next" in self.config["scanner"]
-                else True
-            )
-
-            # self.autostart = (
-            #     self.config["scanner"]["autostart"]
-            #     if "autostart" in self.config["scanner"]
-            #     else True
-            # )
-
-        if "datafolder" in self.config["telegram"]:
-            self.datafolder = self.config["telegram"]["datafolder"]
+        self.token = self.helper.config["telegram"]["token"]
+        self.userid = self.helper.config["telegram"]["user_id"]
 
         if args.datafolder != "":
-            self.datafolder = args.datafolder
+            self.helper.datafolder = args.datafolder
 
-        if not os.path.exists(os.path.join(self.datafolder, "telegram_data")):
-            os.mkdir(os.path.join(self.datafolder, "telegram_data"))
+        if not os.path.exists(os.path.join(self.helper.datafolder, "telegram_data")):
+            os.mkdir(os.path.join(self.helper.datafolder, "telegram_data"))
 
-        if os.path.isfile(os.path.join(self.datafolder, "telegram_data", "data.json")):
-            self._read_data()
-            if "markets" not in self.data:
-                self.data.update({"markets": {}})
-                self._write_data()
-            if "scannerexceptions" not in self.data:
-                self.data.update({"scannerexceptions": {}})
-                self._write_data()
+        if os.path.isfile(
+            os.path.join(self.helper.datafolder, "telegram_data", "data.json")
+        ):
+            write_ok, try_count = False, 0
+            while not write_ok and try_count <= 5:
+                try_count += 1
+                self.helper.read_data("data.json")
+                write_ok = True
+                if "trades" not in self.helper.data:
+                    self.helper.data.update({"trades": {}})
+                    write_ok = self.helper.write_data()
+                if "markets" not in self.helper.data:
+                    self.helper.data.update({"markets": {}})
+                    write_ok = self.helper.write_data()
+                if "scannerexceptions" not in self.helper.data:
+                    self.helper.data.update({"scannerexceptions": {}})
+                    write_ok = self.helper.write_data()
+                if not write_ok:
+                    sleep(1)
         else:
             ds = {"trades": {}, "markets": {}, "scannerexceptions": {}}
-            self.data = ds
-            self._write_data()
+            self.helper.data = ds
+            self.helper.write_data()
 
         self.updater = Updater(
             self.token,
             use_context=True,
         )
 
-    def _getUptime(self, date: str):
-        now = str(datetime.now())
-        # If date passed from datetime.now() remove milliseconds
-        if date.find(".") != -1:
-            dt = date.split(".")[0]
-            date = dt
-        if now.find(".") != -1:
-            dt = now.split(".", maxsplit=1)[0]
-            now = dt
+        self.handler = TelegramHandler(self.userid, self.helper)
+        self.control = TelegramControl(self.helper)
+        self.actions = TelegramActions(self.helper)
+        self.editor = ConfigEditor(self.helper)
+        self.setting = SettingsEditor(self.helper)
 
-        now = now.replace("T", " ")
-        now = f"{now}"
-        # Add time in case only a date is passed in
-        # new_date_str = f"{date} 00:00:00" if len(date) == 10 else date
-        date = date.replace("T", " ") if date.find("T") != -1 else date
-        # Add time in case only a date is passed in
-        new_date_str = f"{date} 00:00:00" if len(date) == 10 else date
+        if args.datafolder != "":
+            self.helper.datafolder = args.datafolder
 
-        started = datetime.strptime(new_date_str, "%Y-%m-%d %H:%M:%S")
-        now = datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
-        duration = now - started
-        duration_in_s = duration.total_seconds()
-        hours = divmod(duration_in_s, 3600)[0]
-        duration_in_s -= 3600 * hours
-        minutes = divmod(duration_in_s, 60)[0]
-        return f"{round(hours)}h {round(minutes)}m"
-
-    def _question_which_exchange(self, update):
+    def _question_which_exchange(self, update, context):
         """start new bot ask which exchange"""
 
         self.exchange = ""
         self.overrides = ""
+        self.helper.send_telegram_message(
+            update, "Select the exchange:", markup, context=context
+        )
 
-        update.message.reply_text("Select the exchange:", reply_markup=markup)
-
-    def _answer_which_exchange(self, update) -> bool:
+    def _answer_which_exchange(self, update, context) -> bool:
         """start bot validate exchange and ask which market/pair"""
         if update.message.text.lower() == "cancel":
             update.message.reply_text(
@@ -306,128 +179,92 @@ class TelegramBot(TelegramBotBase):
             return ConversationHandler.END
 
         if (
-            update.message.text == "Coinbase Pro"
+            update.message.text == "Coinbase"
+            or update.message.text == "Coinbase Pro"
             or update.message.text == "Kucoin"
             or update.message.text == "Binance"
         ):
             self.exchange = update.message.text.lower()
-            if update.message.text == "Coinbase Pro":
+            if update.message.text == "Coinbase":
+                self.exchange = "coinbase"
+            elif update.message.text == "Coinbase Pro":
                 self.exchange = "coinbasepro"
         else:
             if self.exchange == "":
-                update.message.reply_text("Invalid Exchange Entered!")
-                # self.newbot_request(update, context)
+                self.helper.send_telegram_message(
+                    update, "Invalid Exchange Entered!.", context=context
+                )
                 return False
-
         return True
 
-    def _question_which_pair(self, update):
-
+    def _question_which_pair(self, update, context):
         self.market = ""
-
-        update.message.reply_text(
-            "Which market/pair is this for?", reply_markup=ReplyKeyboardRemove()
+        self.helper.send_telegram_message(
+            update, "Which market/pair is this for?", ReplyKeyboardRemove(), context
         )
 
-    def _answer_which_pair(self, update) -> bool:
+    def _answer_which_pair(self, update, context) -> bool:
         if update.message.text.lower() == "cancel":
-            update.message.reply_text(
-                "Operation Cancelled", reply_markup=ReplyKeyboardRemove()
+            self.helper.send_telegram_message(
+                update, "Operation Cancelled", ReplyKeyboardRemove(), context
             )
             return ConversationHandler.END
 
-        if self.exchange in ("coinbasepro", "kucoin"):
-            p = re.compile(r"^[1-9A-Z]{2,9}\-[1-9A-Z]{2,5}$")
+        if self.exchange in ("coinbase", "coinbasepro", "kucoin"):
+            p = re.compile(r"^[0-9A-Z]{1,20}\-[1-9A-Z]{2,5}$")
             if not p.match(update.message.text):
-                update.message.reply_text(
-                    "Invalid market format", reply_markup=ReplyKeyboardRemove()
+                self.helper.send_telegram_message(
+                    update, "Invalid market format", ReplyKeyboardRemove(), context
                 )
-                # self.newbot_exchange(update, context)
                 return False
         elif self.exchange == "binance":
-            p = re.compile(r"^[A-Z0-9]{5,13}$")
+            p = re.compile(r"^[A-Z0-9]{4,25}$")
             if not p.match(update.message.text):
-                update.message.reply_text(
-                    "Invalid market format.", reply_markup=ReplyKeyboardRemove()
+                self.helper.send_telegram_message(
+                    update, "Invalid market format.", ReplyKeyboardRemove(), context
                 )
-                # self.newbot_exchange(update, context)
                 return False
 
         self.pair = update.message.text
 
         return True
 
-    def responses(self, update, context):
-
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        query = update.callback_query
-
-        if query.data == "orders" or query.data == "pairs" or query.data == "allactive":
-            self.marginresponse(update, context)
-
-        elif query.data in ("binance", "coinbasepro", "kucoin"):
-            self.showconfigresponse(update, context)
-
-        elif "pause_" in query.data:
-            self.pausebotresponse(update, context)
-
-        elif "restart_" in query.data:
-            self.restartbotresponse(update, context)
-
-        elif "sell_" in query.data:
-            self.sellresponse(update, context)
-
-        elif "buy_" in query.data:
-            self.buyresponse(update, context)
-
-        elif "stop_" in query.data:
-            self.stopbotresponse(update, context)
-
-        elif "start_" in query.data:
-            self.startallbotsresponse(update, context)
-
-        elif "delete_" in query.data:
-            self.deleteresponse(update, context)
-            
-        elif "delexcep_" in query.data:
-            self.ExceptionRemoveCallBack(update, context)
-
-        elif query.data == "cancel":
-            query.edit_message_text("User Cancelled Request")
-
-    # Define a few command handlers. These usually take the two arguments update and context.
-
+    # Define command handlers. These usually take the two arguments update and context.
     def setcommands(self, update, context) -> None:
+        """Set bot commands in telegram"""
         command = [
-            BotCommand("help", "show help text"),
+            BotCommand("controlpanel", "show command buttons"),
+            BotCommand("cleandata", "clean JSON data files"),
+            BotCommand("addexception", "add pair to scanner exception list"),
+            BotCommand("removeexception", "remove pair from scanner exception list"),
+            BotCommand(
+                "scanner", "start auto scan high volume markets and start bots"
+            ),
+            # BotCommand("stopscanner", "stop auto scan high volume markets"),
+            BotCommand("addnew", "add and start a new bot"),
+            # BotCommand("deletebot", "delete bot from startbot list"),
             BotCommand("margins", "show margins for all open trades"),
             BotCommand("trades", "show closed trades"),
             BotCommand("stats", "show exchange stats for market/pair"),
-            BotCommand("showinfo", "show all running bots status"),
-            BotCommand("showconfig", "show config for selected exchange"),
-            BotCommand("addnew", "add and start a new bot"),
-            BotCommand("deletebot", "delete bot from startbot list"),
-            BotCommand("startbots", "start all or selected bot"),
-            BotCommand("stopbots", "stop all or the selected bot"),
-            BotCommand("pausebots", "pause all or selected bot"),
-            BotCommand("resumebots", "resume paused bots"),
-            BotCommand("buy", "manual buy"),
-            BotCommand("sell", "manual sell"),
-            BotCommand("addexception", "add pair to scanner exception list"),
-            BotCommand("removeexception", "remove pair from scanner exception list"),
-            BotCommand("startscanner", "start auto scan high volume markets and start bots"),
-            BotCommand("stopscanner", "stop auto scan high volume markets")
+            BotCommand("help", "show help text")
+            # BotCommand("showinfo", "show all running bots status"),
+            # BotCommand("showconfig", "show config for selected exchange"),
+            # BotCommand("startbots", "start all or selected bot"),
+            # BotCommand("stopbots", "stop all or the selected bot"),
+            # BotCommand("pausebots", "pause all or selected bot"),
+            # BotCommand("resumebots", "resume paused bots"),
+            # BotCommand("buy", "manual buy"),
+            # BotCommand("sell", "manual sell"),
         ]
 
         ubot = Bot(self.token)
         ubot.set_my_commands(command)
 
-        update.message.reply_text(
+        self.helper.send_telegram_message(
+            update,
             "<i>Bot Commands Created</i>",
-            parse_mode="HTML",
-            reply_markup=ReplyKeyboardRemove(),
+            ReplyKeyboardRemove(),
+            context=context,
         )
 
     def help(self, update, context):
@@ -439,204 +276,40 @@ class TelegramBot(TelegramBotBase):
         )
         helptext += "<b>/margins</b> - <i>show margins for open trade</i>\n"
         helptext += "<b>/trades</b> - <i>show closed trades</i>\n"
-        helptext += "<b>/stats</b> - <i>display stats for market</i>\n"
-        helptext += "<b>/showinfo</b> - <i>display bot(s) status</i>\n"
-        helptext += "<b>/showconfig</b> - <i>show config for exchange</i>\n\n"
+        helptext += "<b>/stats</b> - <i>display stats for market</i>\n\n"
         helptext += "<b>Interactive Command List</b>\n\n"
-        helptext += "<b>/addnew</b> - <i>start the requested pair</i>\n"
-        helptext += "<b>/pausebots</b> - <i>pause all or the selected bot</i>\n"
-        helptext += "<b>/resumebots</b> - <i>resume paused bots</i>\n"
-        helptext += "<b>/stopbots</b> - <i>stop all or the selected bots</i>\n"
-        helptext += "<b>/startbots</b> - <i>start all or the selected bots</i>\n"
-        helptext += "<b>/sell</b> - <i>sell market pair on next iteration</i>\n"
-        helptext += "<b>/buy</b> - <i>buy market pair on next iteration</i>\n\n"
+        helptext += "<b>/controlpanel</b> - <i>show interactive control buttons</i>\n"
+        helptext += "<b>/cleandata</b> - <i>check and remove any bad Json files</i>\n"
+        helptext += "<b>/addnew</b> - <i>start the requested pair</i>\n\n"
         helptext += "<b>Market Scanner Commands</b>\n\n"
-        helptext += "<b>/startscanner</b> - <i>start auto scan high volume markets and start bots</i>\n"
-        helptext += "<b>/stopscanner</b> - <i>stop auto scan high volume markets</i>\n"
+        helptext += "<b>/scanner</b> - <i>start auto scan high volume markets and start bots</i>\n"
         helptext += "<b>/addexception</b> - <i>add pair to scanner exception list</i>\n"
-        helptext += "<b>/removeexception</b> - <i>remove pair from scanner exception list</i>\n"
+        helptext += (
+            "<b>/removeexception</b> - <i>remove pair from scanner exception list</i>\n"
+        )
 
-        mbot = Telegram(self.token, str(context._chat_id_and_data[0]))
-
-        mbot.send(helptext, parsemode="HTML")
-
-    def showbotinfo(self, update, context) -> None:
-        """Show running bot status"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        mbot = Telegram(self.token, str(context._chat_id_and_data[0]))
-
-        jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-        output = ""
-        bots = 0
-        for file in jsonfiles:
-            if (
-                ".json" in file
-                and not file == "data.json"
-                and not file.__contains__("output.json")
-            ):
-                bots += 1
-                output = ""
-                self._read_data(file)
-                output = output + f"\U0001F4C8 <b>{file.replace('.json', '')}</b> "
-
-                last_modified = datetime.now() - datetime.fromtimestamp(
-                    os.path.getmtime(
-                        os.path.join(self.datafolder, "telegram_data", file)
-                    )
-                )
-                # print(f"{file} {last_modified.seconds < 120} {last_modified} {last_modified.seconds}")
-
-                if "margin" in self.data:
-                    if (
-                        self.data["botcontrol"]["status"] == "active"
-                        and last_modified.seconds < 120
-                        or last_modified.seconds == 86399
-                    ):
-                        output = (
-                            output
-                            + f" \U00002705 <b>Status</b>: <i>{self.data['botcontrol']['status']}</i> "
-                        )
-                    elif self.data["botcontrol"]["status"] == "paused":
-                        output = (
-                            output
-                            + f" \U000023F8 <b>Status</b>: <i>{self.data['botcontrol']['status']}</i> "
-                        )
-                    elif self.data["botcontrol"]["status"] == "exit":
-                        output = (
-                            output
-                            + f" \U0000274C <b>Status</b>: <i>{self.data['botcontrol']['status']}</i> "
-                        )
-                    elif last_modified.seconds > 90:
-                        output = (
-                            output + " \U0001F6D1	 <b>Status</b>: <i>defaulted</i> "
-                        )
-                else:
-                    output = output + " \U0001F6D1	 <b>Status</b>: <i>stopped</i> "
-
-                if "botcontrol" in self.data and "started" in self.data['botcontrol']:
-                    output = (
-                        output
-                        + f" \u23F1 <b>Uptime</b>: <i>{self._getUptime(self.data['botcontrol']['started'])}</i>\n"
-                    )
-                mbot.send(output, parsemode="HTML")
-                sleep(0.2)
-
-        output = f"<b>Bot Count ({bots})</b>"
-        print(output)
-        mbot.send(output, parsemode="HTML")
+        self.helper.send_telegram_message(update, helptext, context=context)
 
     def trades(self, update, context):
         """List trades"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return
 
-        self._read_data()
-
-        output = ""
-        for time in self.data["trades"]:
-            output = ""
-            output = output + f"<b>{self.data['trades'][time]['pair']}</b>\n{time}"
-            output = (
-                output
-                + f"\n<i>Sold at: {self.data['trades'][time]['price']}   Margin: {self.data['trades'][time]['margin']}</i>\n"
-            )
-
-            if output != "":
-                mbot = Telegram(self.token, str(context._chat_id_and_data[0]))
-                mbot.send(output, parsemode="HTML")
-
-    def marginrequest(self, update, context):
-        """Ask what user wants to see active order/pairs or all"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        keyboard = [
-            [
-                InlineKeyboardButton("Active Orders", callback_data="orders"),
-                InlineKeyboardButton("Active Pairs", callback_data="pairs"),
-                InlineKeyboardButton("All", callback_data="allactive"),
-            ],
-            [InlineKeyboardButton("Cancel", callback_data="cancel")],
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        update.message.reply_text("Make your selection", reply_markup=reply_markup)
-
-    def marginresponse(self, update: Updater, context):
-        """Show current active orders/pairs or all margins or latest messages"""
-        if not self._checkifallowed(str(context._user_id_and_data[0]), update):
-            return
-
-        jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-        openoutput = ""
-        closeoutput = ""
-        for file in jsonfiles:
-            if (
-                ".json" in file
-                and not file == "data.json"
-                and not file.__contains__("output.json")
-            ):
-                self._read_data(file)
-                if "margin" in self.data:
-                    if "margin" in self.data and self.data["margin"] == " ":
-                        closeoutput = (
-                            closeoutput + f"<b>{str(file).replace('.json', '')}</b>"
-                        )
-                        closeoutput = closeoutput + f"\n<i>{self.data['message']}</i>\n"
-                    elif len(self.data) > 2:
-                        space = 20 - len(str(file).replace(".json", ""))
-                        margin_icon = (
-                            "\U0001F7E2"
-                            if "-" not in self.data["margin"]
-                            else "\U0001F534"
-                        )
-                        openoutput = (
-                            openoutput
-                            + f"\U0001F4C8 <b>{str(file).replace('.json', '')}</b> ".ljust(
-                                space
-                            )
-                        )
-                        openoutput = (
-                            openoutput
-                            + f" {margin_icon}<i>Current Margin: {self.data['margin']}  \U0001F4B0 (P/L): {self.data['delta']}</i>\n"
-                        )
-
-        query = update.callback_query
-
-        if query.data == "orders":
-            if openoutput == "":
-                query.edit_message_text(
-                    "<b>No open orders found.</b>", parse_mode="HTML"
-                )
-            else:
-                query.edit_message_text(
-                    f"<b>Open Order(s)</b>\n{openoutput}", parse_mode="HTML"
-                )
-        elif query.data == "pairs":
-            if closeoutput == "":
-                query.edit_message_text(
-                    "<b>No active pairs found.</b>", parse_mode="HTML"
-                )
-            else:
-                query.edit_message_text(
-                    f"<b>Active Pair(s)</b>\n{closeoutput}", parse_mode="HTML"
-                )
-        elif query.data == "allactive":
-            query.edit_message_text(
-                f"<b>Open Order(s)</b>\n{openoutput}", parse_mode="HTML"
-            )
-            mbot = Telegram(self.token, str(context._chat_id_and_data[0]))
-            mbot.send(f"<b>Active Pair(s)</b>\n{closeoutput}", parsemode="HTML")
+        self.handler.get_trade_options(None, None)
+        return
 
     def statsrequest(self, update: Updater, context):
         """Ask which exchange stats are wanted for"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
-        update.message.reply_text("Select the exchange", reply_markup=markup)
+        self.helper.send_telegram_message(
+            update, "Select the exchange", markup, context=context
+        )
 
         return CHOOSING
 
@@ -646,24 +319,30 @@ class TelegramBot(TelegramBotBase):
             return None
 
         if update.message.text.lower() == "cancel":
-            update.message.reply_text(
-                "Operation Cancelled", reply_markup=ReplyKeyboardRemove()
+            self.helper.send_telegram_message(
+                update, "Operation Cancelled", ReplyKeyboardRemove(), context=context
             )
             return ConversationHandler.END
 
-        if update.message.text in ("Coinbase Pro", "Kucoin", "Binance"):
+        if update.message.text in ("Coinbase", "Coinbase Pro", "Kucoin", "Binance"):
             self.exchange = update.message.text.lower()
-            if update.message.text == "Coinbase Pro":
+            if update.message.text == "Coinbase":
+                self.exchange = "coinbase"
+            elif update.message.text == "Coinbase Pro":
                 self.exchange = "coinbasepro"
         else:
             if self.exchange == "":
-                update.message.reply_text("Invalid Exchange Entered!")
+                self.helper.send_telegram_message(
+                    update, "Invalid Exchange Entered!", context=context
+                )
                 self.statsrequest(update, context)
                 return None
 
-        update.message.reply_text(
+        self.helper.send_telegram_message(
+            update,
             "Which market/pair do you want stats for?",
-            reply_markup=ReplyKeyboardRemove(),
+            ReplyKeyboardRemove(),
+            context=context,
         )
 
         return TYPING_REPLY
@@ -674,417 +353,81 @@ class TelegramBot(TelegramBotBase):
             return None
 
         if update.message.text.lower() == "cancel":
-            update.message.reply_text(
-                "Operation Cancelled", reply_markup=ReplyKeyboardRemove()
+            self.helper.send_telegram_message(
+                update, "Operation Cancelled", ReplyKeyboardRemove(), context=context
             )
             return ConversationHandler.END
 
-        if self.exchange == "coinbasepro" or self.exchange == "kucoin":
-            p = re.compile(r"^[1-9A-Z]{2,5}\-[1-9A-Z]{2,5}$")
+        if self.exchange in ("coinbase", "coinbasepro", "kucoin"):
+            p = re.compile(r"^[0-9A-Z]{1,20}\-[1-9A-Z]{2,5}$")
             if not p.match(update.message.text):
-                update.message.reply_text(
-                    "Invalid market format", reply_markup=ReplyKeyboardRemove()
+                self.helper.send_telegram_message(
+                    update,
+                    "Invalid market format",
+                    ReplyKeyboardRemove(),
+                    context=context,
                 )
                 self.stats_exchange_received(update, context)
                 return None
         elif self.exchange == "binance":
-            p = re.compile(r"^[A-Z0-9]{5,12}$")
+            p = re.compile(r"^[A-Z0-9]{4,25}$")
             if not p.match(update.message.text):
-                update.message.reply_text(
-                    "Invalid market format.", reply_markup=ReplyKeyboardRemove()
+                self.helper.send_telegram_message(
+                    update,
+                    "Invalid market format",
+                    ReplyKeyboardRemove(),
+                    context=context,
                 )
                 self.stats_exchange_received(update, context)
                 return None
 
         self.pair = update.message.text
 
-        update.message.reply_text(
-            "<i>Gathering Stats, please wait...</i>", parse_mode="HTML"
+        self.helper.send_telegram_message(
+            update, "<i>Gathering Stats, please wait...</i>", context=context
         )
-        output = subprocess.getoutput(
-            f"python3 pycryptobot.py --stats --exchange {self.exchange}  --market {self.pair}  "
+
+        output = self.helper.start_process(
+            self.pair, self.exchange, "--stats --live 1", "telegram", True
         )
-        update.message.reply_text(output, parse_mode="HTML")
+
+        self.helper.send_telegram_message(update, output, context=context)
 
         return ConversationHandler.END
 
-    def sellrequest(self, update, context):
-        """Manual sell request (asks which coin to sell)"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = self._getoptions("sell", "")
-
-        if len(buttons) > 0:
-            reply_markup = InlineKeyboardMarkup(buttons)
-            update.message.reply_text(
-                "<b>What do you want to sell?</b>",
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-        else:
-            update.message.reply_text("No active bots found.")
-
-    def sellresponse(self, update, context):
-        """create the manual sell order"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        query = update.callback_query
-
-        self._read_data(query.data.replace("sell_", ""))
-        if "botcontrol" in self.data:
-            self.data["botcontrol"]["manualsell"] = True
-            self._write_data(query.data.replace("sell_", ""))
-            query.edit_message_text(
-                f"Selling: {query.data.replace('sell_', '').replace('.json','')}\n<i>Please wait for sale notification...</i>",
-                parse_mode="HTML",
-            )
-
-    def buyrequest(self, update, context):
-        """Manual buy request (asks which coin to buy)"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = self._getoptions("buy", "")
-
-        if len(buttons) > 0:
-            reply_markup = InlineKeyboardMarkup(buttons)
-            update.message.reply_text(
-                "<b>What do you want to buy?</b>",
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-        else:
-            update.message.reply_text("No active bots found.")
-
-    def buyresponse(self, update, context):
-        """create the manual sell order"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        query = update.callback_query
-
-        self._read_data(query.data.replace("buy_", ""))
-        if "botcontrol" in self.data:
-            self.data["botcontrol"]["manualbuy"] = True
-            self._write_data(query.data.replace("buy_", ""))
-            query.edit_message_text(
-                f"Buying: {query.data.replace('buy_', '').replace('.json','')}\n<i>Please wait for buy notification...</i>",
-                parse_mode="HTML",
-            )
-
-    def showconfigrequest(self, update, context):
-        """display config settings (ask which exchange)"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        keyboard = []
-        for exchange in self.config:
-            if not exchange == "telegram":
-                keyboard.append(
-                    [InlineKeyboardButton(exchange, callback_data=exchange)]
-                )
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        update.message.reply_text("Select exchange", reply_markup=reply_markup)
-
-    def showconfigresponse(self, update, context):
-        """display config settings based on exchanged selected"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        with open(os.path.join(self.config_file), "r", encoding="utf8") as json_file:
-            self.config = json.load(json_file)
-
-        query = update.callback_query
-
-        pbot = self.config[query.data]["config"]
-
-        query.edit_message_text(query.data + "\n" + json.dumps(pbot, indent=4))
-
-    def pausebotrequest(self, update, context) -> None:
-        """Ask which bots to pause"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = self._getoptions("pause", "active")
-
-        if len(buttons) > 0:
-            reply_markup = InlineKeyboardMarkup(buttons)
-            update.message.reply_text(
-                "<i>What do you want to pause?</i>",
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-        else:
-            update.message.reply_text("No active bots found.")
-
-    def pausebotresponse(self, update, context):
-        """Pause all or selected bot"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        query = update.callback_query
-
-        if query.data == "pause_all":
-            jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-            for file in jsonfiles:
-                if (
-                    ".json" in file
-                    and not file == "data.json"
-                    and not file.__contains__("output.json")
-                ):
-                    if self.updatebotcontrol(file, "pause"):
-                        mbot = Telegram(self.token, str(context._chat_id_and_data[0]))
-                        mbot.send(
-                            f"<i>Pausing {file.replace('.json','')}</i>",
-                            parsemode="HTML",
-                        )
-                        sleep(1)
-        else:
-            if self.updatebotcontrol(query.data.replace("pause_", ""), "pause"):
-                query.edit_message_text(
-                    f"<i>Pausing {query.data.replace('pause_', '').replace('.json','')}</i>",
-                    parse_mode="HTML",
-                )
-
-    def restartbotrequest(self, update, context) -> None:
-        """Ask which bot to restart"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = self._getoptions("restart", "paused")
-
-        if len(buttons) > 0:
-            reply_markup = InlineKeyboardMarkup(buttons)
-            update.message.reply_text(
-                "<b>What do you want to restart?</b>",
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-        else:
-            update.message.reply_text("No paused bots found.")
-
-    def restartbotresponse(self, update, context):
-        """restart selected or all bots"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        query = update.callback_query
-
-        if query.data == "restart_all":
-            jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-            query.edit_message_text(f"Restarting all bots", parse_mode="HTML")
-            for file in jsonfiles:
-                if (
-                    ".json" in file
-                    and not file == "data.json"
-                    and not file.__contains__("output.json")
-                ):
-                    if self.updatebotcontrol(file, "start"):
-                        mbot = Telegram(self.token, str(context._chat_id_and_data[0]))
-                        mbot.send(
-                            f"<i>Restarting {file.replace('.json','')}</i>",
-                            parsemode="HTML",
-                        )
-        else:
-            if self.updatebotcontrol(query.data.replace("restart_", ""), "start"):
-                query.edit_message_text(
-                    f"Restarting {query.data.replace('restart_', '').replace('.json','')}",
-                    parse_mode="HTML",
-                )
-
-    def startallbotsrequest(self, update, context) -> None:
-        """Ask which bot to start from start list (or all)"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = []
-        keyboard = []
-
-        self._read_data()
-        for market in self.data["markets"]:
-            if not os.path.isfile(
-                os.path.join(self.datafolder, "telegram_data", market + ".json")
-            ):
-                buttons.append(
-                    InlineKeyboardButton(market, callback_data="start_" + market)
-                )
-
-        if len(buttons) > 0:
-            if len(buttons) > 1:
-                keyboard = [
-                    [InlineKeyboardButton("All", callback_data="start_" + "_all")]
-                ]
-
-            i = 0
-            while i <= len(buttons) - 1:
-                if len(buttons) - 1 >= i + 2:
-                    keyboard.append([buttons[i], buttons[i + 1], buttons[i + 2]])
-                elif len(buttons) - 1 >= i + 1:
-                    keyboard.append([buttons[i], buttons[i + 1]])
-                else:
-                    keyboard.append([buttons[i]])
-                i += 3
-            keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        update.message.reply_text(
-            "<b>What crypto bots do you want to start?</b>",
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-        )
-
-    def startallbotsresponse(self, update, context) -> None:
-        """start selected or all bots"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        self._read_data()
-
-        query = update.callback_query
-
-        if "all" in query.data:
-            query.edit_message_text("Starting all bots")
-            for pair in self.data["markets"]:
-                if not os.path.isfile(
-                    os.path.join(self.datafolder, "telegram_data", pair + ".json")
-                ):
-                    overrides = self.data["markets"][pair]["overrides"]
-                    if platform.system() == "Windows":
-                        os.system(
-                            f"start powershell -Command $host.UI.RawUI.WindowTitle = '{pair}' ; python3 pycryptobot.py --startmethod telegram {overrides}"
-                        )
-                    else:
-                        subprocess.Popen(
-                            f"python3 pycryptobot.py --startmethod telegram {overrides}", shell=True
-                        )
-                    mBot = Telegram(self.token, str(context._chat_id_and_data[0]))
-                    mBot.send(f"<i>Starting {pair} crypto bot</i>", parsemode="HTML")
-                    sleep(10)
-        else:
-            overrides = self.data["markets"][str(query.data).replace("start_", "")][
-                "overrides"
-            ]
-            if platform.system() == "Windows":
-                os.system(
-                    f"start powershell -Command $host.UI.RawUI.WindowTitle = '{query.data.replace('start_', '')}' ; python3 pycryptobot.py --startmethod telegram {overrides}"
-                )
-                # os.system(f"start powershell -NoExit -Command $host.UI.RawUI.WindowTitle = '{query.data.replace('start_', '')}' ; python3 pycryptobot.py {overrides}")
-            else:
-                subprocess.Popen(f"python3 pycryptobot.py --startmethod telegram {overrides}", shell=True)
-            query.edit_message_text(
-                f"<i>Starting {str(query.data).replace('start_', '')} crypto bots</i>",
-                parse_mode="HTML",
-            )
-
-    def stopbotrequest(self, update, context) -> None:
-        """ask which active bots to stop (or all)"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = self._getoptions("stop", "active")
-
-        if len(buttons) > 0:
-
-            buttons.insert(
-                0,
-                [
-                    InlineKeyboardButton(
-                        "All (w/o open order)", callback_data="stop_allclose"
-                    )
-                ],
-            )
-
-            reply_markup = InlineKeyboardMarkup(buttons)
-            update.message.reply_text(
-                "<b>What do you want to stop?</b>",
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-        else:
-            update.message.reply_text("No active bots found.")
-
-    def stopbotresponse(self, update, context) -> None:
-        """stop all or selected bot"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        query = update.callback_query
-        self._read_data()
-
-        if "allclose" in query.data:
-            query.edit_message_text("Stopping bots")
-            jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-            telegram = Telegram(self.token, str(context._chat_id_and_data[0]))
-            for file in jsonfiles:
-                if (
-                    ".json" in file
-                    and not file == "data.json"
-                    and not file.__contains__("output.json")
-                ):
-                    self._read_data(file)
-                    if "margin" in self.data and self.data["margin"] == " ":
-                        if self.updatebotcontrol(file, "exit"):
-                            telegram.send(
-                                f"Stopping {file.replace('.json', '')} crypto bot"
-                            )
-                            sleep(1)
-
-        elif "all" in query.data:
-            query.edit_message_text("Stopping all bots")
-
-            jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-            telegram = Telegram(self.token, str(context._chat_id_and_data[0]))
-            for file in jsonfiles:
-                if (
-                    ".json" in file
-                    and not file == "data.json"
-                    and not file.__contains__("output.json")
-                ):
-                    if self.updatebotcontrol(file, "exit"):
-                        telegram.send(
-                            f"Stopping {file.replace('.json', '')} crypto bot"
-                        )
-                        sleep(1)
-        else:
-            if self.updatebotcontrol(str(query.data).replace("stop_", ""), "exit"):
-                query.edit_message_text(
-                    f"Stopping {str(query.data).replace('stop_', '').replace('.json', '')} crypto bot"
-                )
-
-        query.edit_message_text("Operation Complete")
-
     def newbot_request(self, update: Updater, context):
         """start new bot ask which exchange"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
-        self._question_which_exchange(update)
+        self._question_which_exchange(update, context)
 
         return EXCHANGE
 
     def newbot_exchange(self, update, context):
         """start bot validate exchange and ask which market/pair"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
-        if not self._answer_which_exchange(update):
+        if not self._answer_which_exchange(update, context):
             self.newbot_request(update, context)
 
-        self._question_which_pair(update)
+        self._question_which_pair(update, context)
 
         return ANYOVERRIDES
 
     def newbot_any_overrides(self, update, context) -> None:
         """start bot validate market and ask if overrides required"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
-        if not self._answer_which_pair(update):
+        if not self._answer_which_pair(update, context):
             self.newbot_exchange(update, context)
             return None
 
@@ -1092,33 +435,41 @@ class TelegramBot(TelegramBotBase):
 
         mark_up = ReplyKeyboardMarkup(r_keyboard, one_time_keyboard=True)
 
-        update.message.reply_text(
-            "Do you want to use any commandline overrides?", reply_markup=mark_up
+        self.helper.send_telegram_message(
+            update, "Do you want to use any commandline overrides?", mark_up, context
         )
 
         return MARKET
 
     def newbot_market(self, update, context):
         """start bot - ask for overrides if none required ask to save bot"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
         if update.message.text == "No":
             reply_keyboard = [["Yes", "No"]]
-            markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-            update.message.reply_text("Do you want to save this?", reply_markup=markup)
+            mark_up = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+            self.helper.send_telegram_message(
+                update, "Do you want to save this?", mark_up, context
+            )
             return SAVE
 
-        update.message.reply_text(
+        self.helper.send_telegram_message(
+            update,
             "Tell me any other commandline overrides to use?",
-            reply_markup=ReplyKeyboardRemove(),
+            ReplyKeyboardRemove(),
+            context,
         )
 
         return OVERRIDES
 
     def newbot_overrides(self, update, context):
         """start bot - ask to save bot"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
         # Telegram desktop client can auto replace -- with a single long dash
@@ -1128,440 +479,352 @@ class TelegramBot(TelegramBotBase):
         )
 
         reply_keyboard = [["Yes", "No"]]
-        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-        update.message.reply_text("Do you want to save this?", reply_markup=markup)
+        mark_up = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+        self.helper.send_telegram_message(
+            update, "Do you want to save this?", mark_up, context
+        )
 
         return SAVE
 
     def newbot_save(self, update, context):
         """start bot - save if required ask if want to start"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
-
+        self.helper.logger.info("called newbot_save")
         if update.message.text == "Yes":
-            self._read_data()
-            if "markets" in self.data:
-                if not self.pair in self.data["markets"]:
-                    self.data["markets"].update(
-                        {
-                            self.pair: {
-                                "overrides": f"--exchange {self.exchange} --market {self.pair} {self.overrides}"
+            write_ok, try_count = False, 0
+            while not write_ok and try_count <= 5:
+                try_count += 1
+                try:
+                    self.helper.read_data()
+                    if "markets" in self.helper.data:
+                        if self.pair not in self.helper.data["markets"]:
+                            self.helper.data["markets"].update(
+                                {
+                                    self.pair: {
+                                        "overrides": f"--exchange {self.exchange} --market {self.pair} {self.overrides}"
+                                    }
+                                }
+                            )
+                            write_ok = self.helper.write_data()
+                            if write_ok:
+                                self.helper.send_telegram_message(
+                                    update, f"{self.pair} saved \u2705", context=context
+                                )
+                            else:
+                                sleep(1)
+                        else:
+                            self.helper.send_telegram_message(
+                                update,
+                                f"{self.pair} already setup, no changes made.",
+                                context=context,
+                            )
+                            write_ok = True
+                    else:
+                        self.helper.data.update({"markets": {}})
+                        self.helper.data["markets"].update(
+                            {
+                                self.pair: {
+                                    "overrides": f"--exchange {self.exchange} --market {self.pair} {self.overrides}"
+                                }
                             }
-                        }
-                    )
-                    self._write_data()
-                    update.message.reply_text(f"{self.pair} saved \u2705")
-                else:
-                    update.message.reply_text(
-                        f"{self.pair} already setup, no changes made."
-                    )
-            else:
-                self.data.update({"markets": {}})
-                self.data["markets"].update(
-                    {
-                        self.pair: {
-                            "overrides": f"--exchange {self.exchange} --market {self.pair} {self.overrides}"
-                        }
-                    }
-                )
-                self._write_data()
-                update.message.reply_text(f"{self.pair} saved")
+                        )
+                        write_ok = self.helper.write_data()
+                        if write_ok:
+                            self.helper.send_telegram_message(
+                                update, f"{self.pair} saved \u2705", context=context
+                            )
+                        else:
+                            sleep(1)
+                except Exception as err:  # pylint: disable=broad-except
+                    print(err)
 
         reply_keyboard = [["Yes", "No"]]
-        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-        update.message.reply_text("Do you want to start this bot?", reply_markup=markup)
+        mark_up = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+        self.helper.send_telegram_message(
+            update, "Do you want to start this bot?", mark_up, context
+        )
 
         return START
 
     def newbot_start(self, update, context, startmethod: str = "telegram") -> None:
         """start bot - start bot if want"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
-        def IsBotRunning() -> bool:
-            if os.path.isfile(
-                    os.path.join(self.datafolder, "telegram_data", f"{self.pair}.json")
-                ):
-                return True
-            
-            return False
-
-        def StartWindowsProcess() -> None:
-            # subprocess.Popen(f"python3 pycryptobot.py {overrides}", creationflags=subprocess.CREATE_NEW_CONSOLE)
-            os.system(
-                    f"start powershell -Command $host.UI.RawUI.WindowTitle = '{self.pair}' ; "
-                    f"python3 pycryptobot.py --startmethod {startmethod} --exchange {self.exchange} --market {self.pair} {self.overrides}"
-                )
-
-        def StartLinuxProcess() -> None:
-            subprocess.Popen(
-                    f"python3 pycryptobot.py --startmethod {startmethod} --exchange {self.exchange} --market {self.pair} {self.overrides}",
-                    shell=True,
-                )
-
-        if update.message.text == "Auto_Yes":
-            if IsBotRunning():
-                update.message.reply_text(
-                    "Bot is already running, no action taken.",
-                    reply_markup=ReplyKeyboardRemove())
-                return None
-
-            if platform.system() == "Windows":
-                StartWindowsProcess()
-            else:
-                StartLinuxProcess()
-
-        if update.message.text == "Yes":
-
-            if IsBotRunning():
-                update.message.reply_text(
-                    "Bot is already running, no action taken.",
-                    reply_markup=ReplyKeyboardRemove())
-                return None
-
-            if platform.system() == "Windows":
-                StartWindowsProcess()
-                update.message.reply_text(f"{self.pair} crypto bot Starting", reply_markup=ReplyKeyboardRemove())
-            else:
-                StartLinuxProcess()
-                update.message.reply_text(f"{self.pair} crypto bot Starting",reply_markup=ReplyKeyboardRemove())
-
-            update.message.reply_text(
-                "Command Complete, have a nice day.", reply_markup=ReplyKeyboardRemove()
+        if update.message.text == "No":
+            self.helper.send_telegram_message(
+                update,
+                "Command Complete, have a nice day.",
+                ReplyKeyboardRemove(),
+                context,
             )
+            return ConversationHandler.END
+
+        if (
+            self.helper.start_process(
+                self.pair, self.exchange, self.overrides, startmethod
+            )
+            is False
+        ):
+            self.helper.send_telegram_message(
+                update,
+                f"{self.pair} is already running, no action taken.",
+                ReplyKeyboardRemove(),
+                context,
+            )
+        else:
+            if startmethod != "scanner":
+                self.helper.send_telegram_message(
+                    update,
+                    f"{self.pair} crypto bot Starting",
+                    ReplyKeyboardRemove(),
+                    context,
+                )
+
+        self.helper.send_telegram_message(
+            update, "Command Complete, have a nice day.", ReplyKeyboardRemove(), context
+        )
+
         return ConversationHandler.END
-
-    def updatebotcontrol(self, market, status) -> bool:
-        """used to update bot json files for controlling state"""
-        self._read_data(market)
-
-        if "botcontrol" in self.data:
-            self.data["botcontrol"]["status"] = status
-            self._write_data(market)
-            return True
-
-        return False
 
     def error(self, update, context):
         """Log Errors"""
-        if len(context.error.args) > 0 or "message" in context.error:
-            if "HTTPError" in context.error.args[0]: # if "HTTPError" in context.error[0] or 
-                while self.checkconnection() == False:
-                    logger.warning("No internet connection found")
+        try:
+
+            if len(context.error.args) > 0:
+                err_message = f"ERROR: {context.error.args[0]}"
+            elif "message" in context.error:
+                err_message = f"ERROR: {context.error.message}"
+
+            self.helper.send_telegram_message(update, err_message, new_message=True)
+
+        except Exception as err:  # pylint: disable=broad-except
+            print(err)
+
+        self.helper.logger.error(
+            msg="Exception while handling an update:", exc_info=context.error
+        )
+        try:
+            if "HTTPError" in context.error.args[0]:
+                while self.checkconnection() is False:
+                    self.helper.logger.warning("No internet connection found")
                     self.updater.start_polling(poll_interval=30)
                     sleep(30)
                 self.updater.start_polling()
-            else:
-                logger.warning('Update caused error "%s"', context.error.args[0])
+                return
+        except Exception:
+            pass
 
     def done(self, update, context):
         """added for conversations to end"""
         return ConversationHandler.END
-
-    def deleterequest(self, update, context):
-        """ask which bot to delete"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        buttons = []
-        keyboard = []
-
-        self._read_data()
-        for market in self.data["markets"]:
-            buttons.append(
-                InlineKeyboardButton(market, callback_data="delete_" + market)
-            )
-
-        if len(buttons) > 0:
-            i = 0
-            while i <= len(buttons) - 1:
-                if len(buttons) - 1 >= i + 2:
-                    keyboard.append([buttons[i], buttons[i + 1], buttons[i + 2]])
-                elif len(buttons) - 1 >= i + 1:
-                    keyboard.append([buttons[i], buttons[i + 1]])
-                else:
-                    keyboard.append([buttons[i]])
-                i += 3
-            keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        update.message.reply_text(
-            "<b>What crypto bots do you want to delete?</b>",
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-        )
-
-    def deleteresponse(self, update, context):
-        """delete selected bot"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        self._read_data()
-
-        query = update.callback_query
-
-        self.data["markets"].pop(str(query.data).replace("delete_", ""))
-
-        self._write_data()
-
-        query.edit_message_text(
-            f"<i>Deleted {str(query.data).replace('delete_', '')} crypto bot</i>",
-            parse_mode="HTML",
-        )
 
     def checkconnection(self) -> bool:
         """internet connection check"""
         try:
             urllib.request.urlopen("https://api.telegram.org")
             return True
-        except:
+        except Exception:
             print("No internet connection")
             return False
 
-    def StartScanning(self,update,context):
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+    def exception_exchange(self, update, context):
+        """start new bot ask which exchange"""
+        self._question_which_exchange(update, context)
+
+        return EXCEPT_EXCHANGE
+
+    def exception_pair(self, update, context):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return
 
-        if self.autoscandelay > 0 and len(s.get_jobs()) == 0:
-            s.start()
-            s.add_job(self.StartMarketScan, args=(update, context), trigger='interval', minutes=self.autoscandelay*60, name='Volume Auto Scanner', misfire_grace_time=10)
-            update.message.reply_text(
-                f"<b>Scan job schedule created to run every {self.autoscandelay} hour(s)</b> \u2705", parse_mode="HTML"
-            )
-        self.StartMarketScan(update,context, True if len(context.args) > 0 and context.args[0] == "debug" else False, False if len(context.args) > 0 and context.args[0] == "noscan" else True)
+        self._answer_which_exchange(update, context)
 
-    def StopScanning(self,update,context):
-        s.shutdown()
-        update.message.reply_text(
-                "<b>Scan job schedule has been removed</b> \u2705", parse_mode="HTML"
+        self._question_which_pair(update, context)
+
+        return EXCEPT_MARKET
+
+    def exception_add(self, update, context):
+        """start bot - save if required ask if want to start"""
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
+            return None
+
+        self.helper.logger.info("called exception_add")
+
+        self._answer_which_pair(update, context)
+
+        self.helper.read_data()
+
+        if "scannerexceptions" not in self.helper.data:
+            self.helper.data.update({"scannerexceptions": {}})
+
+        if self.pair not in self.helper.data["scannerexceptions"]:
+            write_ok, try_count = False, 0
+            while not write_ok and try_count <= 5:
+                try_count += 1
+                self.helper.data["scannerexceptions"].update({self.pair: {}})
+                write_ok = self.helper.write_data()
+                if not write_ok:
+                    sleep(1)
+            self.helper.send_telegram_message(
+                update,
+                f"{self.pair} Added to Scanner Exception List \u2705",
+                ReplyKeyboardRemove(),
+                context,
+            )
+        else:
+            self.helper.send_telegram_message(
+                update,
+                f"{self.pair} Already on exception list",
+                ReplyKeyboardRemove(),
+                context,
             )
 
-    def StartMarketScan(self, update, context, debug: bool = False, scanmarkets: bool = True):
+        return ConversationHandler.END
 
-        try:
-            with open("scanner.json") as json_file:
-                config = json.load(json_file)
-        except IOError as err:
-            update.message.reply_text(
-                f"<i>scanner.json config error</i>\n{err}", parse_mode="HTML"
-            )
+    def exception_remove(self, update, context):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return
-        # subprocess.Popen("python3 scanner.py", shell=True)
-        if debug == False:
-            if scanmarkets:
-                update.message.reply_text(
-                    f"<i>Gathering market data\nThis can take some time depending on number of pairs\nplease wait...</i> \u23F3", parse_mode="HTML"
+
+        self.control.ask_exception_bot_list(update, context)
+        return
+
+    def marginrequest(self, update, context):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
+            return
+
+        self.handler.ask_margin_type(None, context)
+        return
+
+    def deleterequest(self, update, context):
+        """ask which bot to delete"""
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
+            return
+
+        self.control.ask_delete_bot_list(update, context)
+
+    def scanning(self, update, context):
+        """calling /startscanner from Telegram command list"""
+        if not self._check_if_allowed(context._user_id_and_data[0], update):
+            return
+
+        self.handler.get_scanner_options(None)
+        return
+
+    def cleandata(self, update, context) -> None:
+        """calling /cleandata from Telegram command list"""
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
+            return
+
+        self.helper.clean_data_folder()
+
+        self.actions.get_bot_info(None, context)
+        self.helper.send_telegram_message(update, "<b>Operation Complete</b>", context=context)
+
+    def statstwo(self, update, context):
+        jsonfiles = os.listdir(os.path.join(self.helper.datafolder, "telegram_data"))
+        for file in jsonfiles:
+            exchange = "coinbasepro"
+            if file.__contains__("output.json"):
+                if file.__contains__("coinbasepro"):
+                    exchange = "coinbasepro"
+                elif file.__contains__("coinbase"):
+                    exchange = "coinbase"
+                if file.__contains__("binance"):
+                    exchange = "binance"
+                if file.__contains__("kucoin"):
+                    exchange = "kucoin"
+
+                self.helper.send_telegram_message(
+                    update, "<i>Gathering Stats, please wait...</i>", context=context
                 )
-                output = subprocess.getoutput("python3 scanner.py")
 
-            telegram = Telegram(self.token, str(context._chat_id_and_data[0]))
-            telegram.send("Stopping crypto bots")
-            jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-            for file in jsonfiles:
-                if (
-                    ".json" in file
-                    and not file == "data.json"
-                    and not file.__contains__("output.json")
-                ):
-                    self._read_data(file)
-                    if "margin" in self.data and self.data["margin"] == " ":
-                        if self.updatebotcontrol(file, "exit"):
-                            sleep(5)
-        
-        self._read_data()
-        botcounter = 0
-        for ex in config:
-            for quote in config[ex]["quote_currency"]:
-                update.message.reply_text(f"Starting {ex} ({quote}) bots...", parse_mode="HTML")
-                logger.info(f"{ex} {quote}")
                 with open(
-                    os.path.join(
-                        self.datafolder, "telegram_data", f"{ex}_{quote}_output.json"
-                    ),
+                    os.path.join(self.helper.datafolder, "telegram_data", file),
                     "r",
                     encoding="utf8",
                 ) as json_file:
                     data = json.load(json_file)
 
-                outputmsg =  f"<b>{ex} ({quote})</b> \u23F3 \n"
-
-                for row in data:
-                    if debug:
-                        logger.info("%s", row)
-
-                    if self.maxbotcount > 0 and botcounter > self.maxbotcount:
-                        continue
-                    
-                    if self.enableleverage == False and (
-                        str(row).__contains__("DOWN") or str(row).__contains__("UP")
-                    ):
+                pairs = ""
+                for pair in data:
+                    if pair.__contains__("DOWN") or pair.__contains__("UP"):
                         continue
 
-                    if row in self.data["scannerexceptions"]:
-                        outputmsg = outputmsg + f"*** {row} found on scanner exception list ***\n"
-                    else:
-                        if data[row]["atr72_pcnt"] != None:
-                            if debug:
-                                logger.info(data[row])
-                            if data[row]["atr72_pcnt"] >= self.atr72pcnt:
-                                self.exchange = ex
-                                self.pair = row 
-                                update.message.text = "Auto_Yes"
-                                if self.enable_buy_next and data[row]["buy_next"]:
-                                    outputmsg = outputmsg + f"<i><b>{row}</b>  //--//  <b>atr72_pcnt:</b> {data[row]['atr72_pcnt']}%  //--//  <b>buy_next:</b> {data[row]['buy_next']}</i>\n"
-                                    if debug == False:
-                                        self.newbot_start(update, context, "scanner")
-                                    botcounter += 1
-                                elif not self.enable_buy_next:
-                                    outputmsg = outputmsg + f"<i><b>{row}</b>  //--//  <b>atr72_pcnt:</b> {data[row]['atr72_pcnt']}%</i>\n"
-                                    if debug == False:
-                                        self.newbot_start(update, context, "scanner")
-                                    botcounter += 1
-                                if debug == False:
-                                    sleep(10)
+                    # count += 1
+                    pairs = pairs + pair + " "
 
-                update.message.reply_text(f"{outputmsg}", parse_mode="HTML")
+                output = subprocess.getoutput(
+                    f"python3 pycryptobot.py --stats --exchange {exchange}  --statgroup {pairs}  "
+                )
+                self.helper.send_telegram_message(update, output, context=context)
+                sleep(30)
+                self.helper.send_telegram_message(
+                    update, "Pausing before next set", context=context
+                )
 
-        update.message.reply_text(f"<i>Operation Complete.  ({botcounter-1} started)</i>", parse_mode="HTML")
-
-    def cleandata(self, update, context) -> None:
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
-        for i in range(len(jsonfiles), 0, -1):
-            jfile = jsonfiles[i-1]
-            if (
-                ".json" in jfile
-                and jfile != "data.json"
-                and jfile.__contains__("output.json") == False
-            ):
-                logger.info("checking %s", jfile)
-                self._read_data(jfile)
-                last_modified = datetime.now() - datetime.fromtimestamp(
-                    os.path.getmtime(
-                        os.path.join(self.datafolder, "telegram_data", jfile)
-                    )
-                )                
-                if "margin" not in self.data:
-                    logger.info("deleting %s", jfile)
-                    os.remove(os.path.join(self.datafolder, "telegram_data", jfile))
-                    continue
-                if (
-                    self.data["botcontrol"]["status"] == "active"
-                    and last_modified.seconds > 120
-                    and (last_modified.seconds != 86399 and last_modified.days != -1)
-                ):
-                    logger.info("deleting %s %s", jfile, str(last_modified))
-                    os.remove(os.path.join(self.datafolder, "telegram_data", jfile))
-                    continue
-                elif (
-                    self.data["botcontrol"]["status"] == "exit"
-                    and last_modified.seconds > 120
-                    and last_modified.seconds != 86399
-                ):
-                    logger.info("deleting %s %s", jfile, str(last_modified.seconds))
-                    os.remove(os.path.join(self.datafolder, "telegram_data", jfile))
-
-        self.showbotinfo(update, context)
-        update.message.reply_text("Operation Complete")
-
-    def ExceptionExchange(self, update, context):
-        """start new bot ask which exchange"""
-        self._question_which_exchange(update)
-
-        return EXCEPT_EXCHANGE
-
-    def ExceptionPair(self, update, context):
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        self._answer_which_exchange(update)
-
-        self._question_which_pair(update)
-
-        return EXCEPT_MARKET
-
-    def ExceptionAdd(self, update, context):
-        """start bot - save if required ask if want to start"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
+    def get_bot_list(self, update, context):
+        if not self._check_if_allowed(
+            context._user_id_and_data[0], update
+        ):  # pylint: disable=protected-access
             return None
 
-        self._answer_which_pair(update)
-
-        self._read_data()
-
-        if "scannerexceptions" not in self.data:
-            self.data.update({"scannerexceptions": {}})
-
-        if not self.pair in self.data["scannerexceptions"]:
-            self.data["scannerexceptions"].update({self.pair : {}})
-            self._write_data()
-            update.message.reply_text(f"{self.pair} Added to Scanner Exception List \u2705", reply_markup=ReplyKeyboardRemove())
-        else:
-            update.message.reply_text(f"{self.pair} Already on exception list", reply_markup=ReplyKeyboardRemove())
-
-        return ConversationHandler.END
-
-    def ExceptionRemove(self, update, context):
-        """ask which bot to delete"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
+        # self.handler.get_bot_options(update)
+        # return
 
         buttons = []
-        keyboard = []
 
-        self._read_data()
-        for pair in self.data["scannerexceptions"]:
-            buttons.append(
-                InlineKeyboardButton(pair, callback_data="delexcep_" + pair)
-            )
+        for market in self.helper.get_active_bot_list("active"):
+            read_ok = self.helper.read_data(market)
+            if read_ok and "botcontrol" in self.helper.data:
+                buttons.append(
+                    InlineKeyboardButton(market, callback_data=f"bot_{market}")
+                )
 
         if len(buttons) > 0:
-            i = 0
-            while i <= len(buttons) - 1:
-                if len(buttons) - 1 >= i + 2:
-                    keyboard.append([buttons[i], buttons[i + 1], buttons[i + 2]])
-                elif len(buttons) - 1 >= i + 1:
-                    keyboard.append([buttons[i], buttons[i + 1]])
-                else:
-                    keyboard.append([buttons[i]])
-                i += 3
-            keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+            self.helper.send_telegram_message(
+                update,
+                "<b>Select a market</b>",
+                self.control.sort_inline_buttons(buttons, "bot"),
+                context=context,
+            )
+        else:
+            self.helper.send_telegram_message(
+                update, "<b>No bots found.</b>", context=context
+            )
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    def request(self, update, context):
+        userid = context._user_id_and_data[0]  # pylint: disable=protected-access
 
-        update.message.reply_text(
-            "<b>What do you want to remove from the scanner exception list?</b>",
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-        )
-
-    def ExceptionRemoveCallBack(self, update, context):
-        """delete selected bot"""
-        if not self._checkifallowed(context._user_id_and_data[0], update):
-            return
-
-        self._read_data()
-
-        query = update.callback_query
-
-        self.data["scannerexceptions"].pop(str(query.data).replace("delexcep_", ""))
-
-        self._write_data()
-
-        query.edit_message_text(
-            f"<i>Removed {str(query.data).replace('delexcep_', '')} from exception list. bot</i>",
-            parse_mode="HTML",
-        )
+        if self._check_if_allowed(userid, update):
+            self.helper.load_config()
+            key_markup = self.handler.get_request()
+            self.helper.send_telegram_message(
+                update, "<b>PyCryptoBot Command Panel.</b>", key_markup, context
+            )
 
 
 def main():
     """Start the bot."""
     # Create telegram bot configuration
     botconfig = TelegramBot()
-
     # Get the dispatcher to register handlers
     dp = botconfig.updater.dispatcher
 
@@ -1569,46 +832,35 @@ def main():
     dp.add_handler(CommandHandler("help", botconfig.help))
     dp.add_handler(CommandHandler("margins", botconfig.marginrequest, Filters.all))
     dp.add_handler(CommandHandler("trades", botconfig.trades, Filters.text))
-    dp.add_handler(
-        CommandHandler("showconfig", botconfig.showconfigrequest, Filters.text)
-    )
-    dp.add_handler(CommandHandler("showinfo", botconfig.showbotinfo, Filters.text))
 
     # General Action Command
     dp.add_handler(CommandHandler("setcommands", botconfig.setcommands))
-    dp.add_handler(CommandHandler("buy", botconfig.buyrequest, Filters.text))
-    dp.add_handler(CommandHandler("sell", botconfig.sellrequest, Filters.text))
-    dp.add_handler(CommandHandler("pausebots", botconfig.pausebotrequest, Filters.text))
     dp.add_handler(
-        CommandHandler("resumebots", botconfig.restartbotrequest, Filters.text)
+        CommandHandler("scanner", botconfig.scanning, Filters.text)
     )
-    dp.add_handler(CommandHandler("startbots", botconfig.startallbotsrequest))
-    dp.add_handler(CommandHandler("stopbots", botconfig.stopbotrequest))
-    dp.add_handler(CommandHandler("buy", botconfig.buyrequest, Filters.text))
-    dp.add_handler(CommandHandler("sell", botconfig.sellrequest, Filters.text))
-    dp.add_handler(CommandHandler("deletebot", botconfig.deleterequest, Filters.text))
-
-    dp.add_handler(CommandHandler("startscanner", botconfig.StartScanning, Filters.text))
-    dp.add_handler(CommandHandler("stopscanner", botconfig.StopScanning, Filters.text))
-
     dp.add_handler(CommandHandler("cleandata", botconfig.cleandata, Filters.text))
+    dp.add_handler(
+        CommandHandler("removeexception", botconfig.exception_remove, Filters.text)
+    )
 
-    dp.add_handler(CommandHandler("removeexception", botconfig.ExceptionRemove, Filters.text))
-
+    dp.add_handler(CommandHandler("ex", botconfig.get_bot_list))
+    dp.add_handler(CommandHandler("statsgroup", botconfig.statstwo))
     # Response to Question handler
-    dp.add_handler(CallbackQueryHandler(botconfig.responses))
+    dp.add_handler(CallbackQueryHandler(botconfig.handler.get_response))
+
+    dp.add_handler(CommandHandler("controlPanel", botconfig.request))
 
     conversation_exception = ConversationHandler(
-        entry_points=[CommandHandler("addexception", botconfig.ExceptionExchange)],
+        entry_points=[CommandHandler("addexception", botconfig.exception_exchange)],
         states={
             EXCEPT_EXCHANGE: [
                 MessageHandler(
-                    Filters.text, botconfig.ExceptionPair, pass_user_data=True
+                    Filters.text, botconfig.exception_pair, pass_user_data=True
                 )
             ],
             EXCEPT_MARKET: [
                 MessageHandler(
-                    Filters.text, botconfig.ExceptionAdd, pass_user_data=True
+                    Filters.text, botconfig.exception_add, pass_user_data=True
                 )
             ],
         },
@@ -1653,12 +905,20 @@ def main():
     # log all errors
     dp.add_error_handler(botconfig.error)
 
-    while botconfig.checkconnection() is False:
-        sleep(30)
+    botconfig.helper.clean_data_folder()
 
     # Start the Bot
     botconfig.updater.start_polling()
+    botconfig.helper.logger.info("Telegram Bot is listening")
+    botconfig.setcommands(None, None)
+    botconfig.updater.bot.send_message(
+        text="Online and ready.", chat_id=botconfig.helper.config["telegram"]["user_id"]
+    )
 
+    if botconfig.helper.autostart:
+        botconfig.actions.start_open_orders(None, None)
+        botconfig.handler._check_scheduled_job()
+        botconfig.actions.start_market_scan(None, None, use_default_scanner=botconfig.helper.use_default_scanner)
     # Run the bot until you press Ctrl-C
     # since start_polling() is non-blocking and will stop the bot gracefully.
     botconfig.updater.idle()

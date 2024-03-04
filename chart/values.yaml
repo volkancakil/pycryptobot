@@ -56,8 +56,8 @@ affinity: {}
 
 config: >
   {
-      "api_url" : "https://api.pro.coinbase.com",
-      "api_key_file" : "/app/keys/coinbase.key"
+      "api_url" : "https://api.coinbase.com",
+      "api_key_file" : "/app/keys/coinbase.key",
       "config" : {
           "cryptoMarket" : "BTC",
           "fiatMarket" : "GBP",
@@ -67,6 +67,10 @@ config: >
   }
 
 binance_key: |
+  0000000000000000000000000000000000000000000000000000000000000000
+  0000000000000000000000000000000000000000000000000000000000000000
+
+coinbase_key: |
   0000000000000000000000000000000000000000000000000000000000000000
   0000000000000000000000000000000000000000000000000000000000000000
 
